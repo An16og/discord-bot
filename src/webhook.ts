@@ -28,6 +28,7 @@ interface IssuesEvent {
     title: string;
     html_url: string;
     state: "open" | "closed";
+    state_reason?: string | null;
     labels: { name: string }[];
     assignees: { login: string }[];
     pull_request?: unknown;
@@ -80,9 +81,14 @@ export function isStarterIssue(labels: string[], cfg: Config): boolean {
   return names.some((n) => cfg.starterLabels.includes(n)) && !names.includes("blocked");
 }
 
-export function starterState(issue: IssuesEvent["issue"]): StarterState {
-  if (issue.state === "closed") return { kind: "done" };
-  const assignee = issue.assignees[0];
+export function starterState(issue: IssuesEvent["issue"], cfg?: Config, action?: string): StarterState {
+  if (action === "deleted" || action === "transferred") return { kind: "unavailable" };
+  if (issue.state === "closed") {
+    return issue.state_reason && issue.state_reason !== "completed" ? { kind: "unavailable" } : { kind: "done" };
+  }
+  const labels = (issue.labels ?? []).map((l) => l.name);
+  if (cfg && !isStarterIssue(labels, cfg)) return { kind: "unavailable" };
+  const assignee = issue.assignees?.[0];
   return assignee ? { kind: "claimed", by: assignee.login } : { kind: "open" };
 }
 
@@ -95,7 +101,7 @@ interface FeedRecord {
 // claimed, released or closed, so the feed always shows what's really free.
 async function onIssue(e: IssuesEvent, env: Env, cfg: Config): Promise<string> {
   if (!ours(cfg, e.repository) || e.issue.pull_request) return "ignored issue";
-  const labels = e.issue.labels.map((l) => l.name);
+  const labels = (e.issue.labels ?? []).map((l) => l.name);
   const issue: StarterIssue = {
     repo: e.repository.name,
     number: e.issue.number,
@@ -105,15 +111,19 @@ async function onIssue(e: IssuesEvent, env: Env, cfg: Config): Promise<string> {
   };
   const key = `issue:${issue.repo}#${issue.number}`;
   const record = await env.STATE.get<FeedRecord>(key, "json");
-  const state = starterState(e.issue);
+  const state = starterState(e.issue, cfg, e.action);
 
   if (!record) {
     // A new post needs a reason: a starter label was just added, or the issue
-    // became free again. "opened" is skipped on purpose, because GitHub also
+    // became free again (unassigned, reopened or unblocked). "opened" is
+    // skipped on purpose, because GitHub also
     // sends "labeled" for every label an issue is created with.
     const starterLabelAdded =
       e.action === "labeled" && cfg.starterLabels.includes((e.label?.name ?? "").toLowerCase());
-    const freedUp = e.action === "unassigned" || e.action === "reopened";
+    const freedUp =
+      e.action === "unassigned" ||
+      e.action === "reopened" ||
+      (e.action === "unlabeled" && (e.label?.name ?? "").toLowerCase() === "blocked");
     if (!starterLabelAdded && !freedUp) return "ignored issue";
     // Only announce issues that are free to take right now.
     if (state.kind !== "open" || !isStarterIssue(labels, cfg)) return "ignored issue";

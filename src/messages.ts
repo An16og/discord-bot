@@ -7,7 +7,7 @@ import type { StarterIssue } from "./github";
 import type { Leaderboard, LeaderboardRow } from "./leaderboard";
 import type { ProgramStatus } from "./programs";
 
-const COLOR = { open: 0x2ea043, claimed: 0x8b949e, done: 0x8957e5, release: 0x1f6feb, merged: 0x8957e5, gold: 0xd4a72c };
+const COLOR = { open: 0x2ea043, claimed: 0x8b949e, done: 0x8957e5, unavailable: 0xf85149, release: 0x1f6feb, merged: 0x8957e5, gold: 0xd4a72c };
 
 // Discord's limits: embed title 256, embed description 4096.
 export function truncate(text: string, max: number): string {
@@ -40,7 +40,7 @@ export function releaseMessage(repo: string, release: { name: string | null; tag
   };
 }
 
-export type StarterState = { kind: "open" } | { kind: "claimed"; by: string } | { kind: "done" };
+export type StarterState = { kind: "open" } | { kind: "claimed"; by: string } | { kind: "done" } | { kind: "unavailable" };
 
 export function starterIssueMessage(issue: StarterIssue, state: StarterState): MessagePayload {
   const labels = issue.labels.join(", ");
@@ -49,13 +49,15 @@ export function starterIssueMessage(issue: StarterIssue, state: StarterState): M
       ? "Open. Comment on the issue to claim it (one issue at a time)."
       : state.kind === "claimed"
         ? `Claimed by ${escapeMarkdown(state.by)}.`
-        : "Done.";
+        : state.kind === "done"
+          ? "Done."
+          : "No longer available.";
   return {
     embeds: [
       {
         title: truncate(`${issue.repo} #${issue.number}: ${issue.title}`, 256),
         url: issue.url,
-        description: `${labels}\n${status}`,
+        description: labels ? `${labels}\n${status}` : status,
         color: COLOR[state.kind],
       },
     ],
@@ -247,10 +249,13 @@ export function checkinReply(result: CheckinResult, roadmap: Roadmap, threadId?:
 export function streaksMessage(
   cfg: Config,
   ranked: (CheckinRecord & { live: number })[],
-  opts: { limit?: number } = {}
+  opts: { limit?: number; roadmap?: string } = {}
 ): MessagePayload {
+  const wanted = opts.roadmap
+    ? cfg.roadmaps.filter((r) => r.name === opts.roadmap)
+    : cfg.roadmaps;
   const embeds: Embed[] = [];
-  for (const roadmap of cfg.roadmaps) {
+  for (const roadmap of wanted) {
     const rows = ranked.filter((r) => r.roadmap === roadmap.id);
     if (rows.length === 0) continue;
     const lines = rows.slice(0, opts.limit ?? 10).map((r, i) => {
@@ -261,6 +266,9 @@ export function streaksMessage(
     embeds.push({ title: roadmap.name, url: roadmap.url, description: lines.join("\n"), color: COLOR.gold });
   }
   if (embeds.length === 0) {
+    if (opts.roadmap) {
+      return { content: `Nobody has checked in on **${opts.roadmap}** yet. Run \`/checkin\` to start your streak.` };
+    }
     return { content: "Nobody has checked in yet. Run `/checkin` to start your streak." };
   }
   return { content: "Learning streaks. Check in every day with `/checkin` to keep yours alive.", embeds };
