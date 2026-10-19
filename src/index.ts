@@ -10,10 +10,11 @@ import { leaderboardMessage, LINK_BUTTON_ID, streaksMessage } from "./messages";
 import { linkingEnabled } from "./oauth";
 import { cardSvg } from "./card";
 import { contributorPage, leaderboardJson, leaderboardPage, noticePage, standing } from "./page";
-import { currentProgram, findProgram, leaderboardUrl, programStatus } from "./programs";
+import { currentProgram, findProgram, LEADERBOARD_PATH, leaderboardUrl, programStatus } from "./programs";
 import { verifyDiscordRequest, verifyGithubSignature } from "./verify";
-import { handleGithubEvent } from "./webhook";
+import { handleGithubEvent, resyncStarterIssues } from "./webhook";
 import { welcomeNewMembers } from "./welcome";
+import { version } from "../package.json";
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
@@ -259,9 +260,6 @@ async function handleContributor(
   return new Response(html, { headers: { ...PAGE_HEADERS, "Cache-Control": "public, max-age=300", "Content-Security-Policy": CONTRIBUTOR_CSP } });
 }
 
-// /leaderboard, /leaderboard.json, /leaderboard/{id} and /leaderboard/{id}.json
-const LEADERBOARD_PATH = /^\/leaderboard(?:\/([a-z0-9][a-z0-9-]*))?(\.json)?$/;
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -285,7 +283,7 @@ export default {
     if (person) return handleContributor(request, env, ctx, person[1]!, person[2]!, person[3] !== undefined);
     if (request.method === "GET" && pathname === "/link/callback") return handleLinkCallback(request, env);
     if (request.method === "GET" && pathname === "/") {
-      return json({ name: "codercops-discord-bot", source: "https://github.com/codercops/discord-bot", commit: env.GIT_SHA || "dev" });
+      return json({ name: "codercops-discord-bot", source: "https://github.com/codercops/discord-bot", version, commit: env.GIT_SHA || "dev" });
     }
     return new Response("not found", { status: 404 });
   },
@@ -294,7 +292,10 @@ export default {
     const cfg = getConfig(env);
     const now = new Date(controller.scheduledTime);
     if (controller.cron === DAILY_CRON) await dailyPosts(env, cfg, now);
-    if (controller.cron === WELCOME_CRON) await welcomeNewMembers(env, cfg, now);
+    if (controller.cron === WELCOME_CRON) {
+      await resyncStarterIssues(env, cfg);
+      await welcomeNewMembers(env, cfg, now);
+    }
   },
 } satisfies ExportedHandler<Env>;
 
@@ -302,43 +303,59 @@ export default {
 // Any day: the final results of a program that has just ended, once.
 async function dailyPosts(env: Env, cfg: Config, now: Date): Promise<void> {
   const monday = now.getUTCDay() === 1;
+  // Each post on its own: one failing doesn't stop the rest. Failures are only
+  // logged, not thrown, so the run never ends as failed and gets retried with
+  // posts that already went out.
+  const attempt = async (post: string, send: () => Promise<void>) => {
+    try {
+      await send();
+    } catch (err) {
+      console.error("daily post failed", post, err);
+    }
+  };
   for (const program of cfg.programs) {
     const status = programStatus(program, now);
     const url = leaderboardUrl(cfg, program);
     if (status === "running" && monday) {
-      const board = await getLeaderboard(env, cfg, program, { fresh: true });
-      const members = await linkedMembers(env, board.rows.slice(0, 10).map((r) => r.login));
-      await sendMessage(env, env.CHANNEL_LEADERBOARD, leaderboardMessage(board, program, { url, members }));
+      await attempt(`leaderboard ${program.id}`, async () => {
+        const board = await getLeaderboard(env, cfg, program, { fresh: true });
+        const members = await linkedMembers(env, board.rows.slice(0, 10).map((r) => r.login));
+        await sendMessage(env, env.CHANNEL_LEADERBOARD, leaderboardMessage(board, program, { url, members }));
+      });
     }
     // Only in the week after the end, so adding an old program to the config
     // doesn't announce it.
     if (status === "ended" && now.getTime() - program.end.getTime() <= WEEK_MS) {
-      const posted = `final:${program.id}`;
-      if (await env.STATE.get(posted)) continue;
-      const board = await getLeaderboard(env, cfg, program, { fresh: true });
-      const members = await linkedMembers(env, board.rows.slice(0, 10).map((r) => r.login));
-      await sendMessage(
-        env,
-        env.CHANNEL_LEADERBOARD,
-        leaderboardMessage(board, program, {
-          final: true,
-          url,
-          finalNote: cfg.finalResultsNote,
-          members,
-          linking: linkingEnabled(env),
-        })
-      );
-      await env.STATE.put(posted, now.toISOString());
+      await attempt(`final results ${program.id}`, async () => {
+        const posted = `final:${program.id}`;
+        if (await env.STATE.get(posted)) return;
+        const board = await getLeaderboard(env, cfg, program, { fresh: true });
+        const members = await linkedMembers(env, board.rows.slice(0, 10).map((r) => r.login));
+        await sendMessage(
+          env,
+          env.CHANNEL_LEADERBOARD,
+          leaderboardMessage(board, program, {
+            final: true,
+            url,
+            finalNote: cfg.finalResultsNote,
+            members,
+            linking: linkingEnabled(env),
+          })
+        );
+        await env.STATE.put(posted, now.toISOString());
+      });
     }
   }
 
   // The streak board, as long as someone checked in during the past week.
   if (monday) {
-    const today = localDate(now, cfg.checkinUtcOffsetMinutes);
-    const weekAgo = localDate(new Date(now.getTime() - WEEK_MS), cfg.checkinUtcOffsetMinutes);
-    const ranked = rankStreaks(await listCheckins(env), today);
-    if (ranked.some((r) => r.lastDate >= weekAgo)) {
-      await sendMessage(env, env.CHANNEL_LEADERBOARD, streaksMessage(cfg, ranked));
-    }
+    await attempt("streak board", async () => {
+      const today = localDate(now, cfg.checkinUtcOffsetMinutes);
+      const weekAgo = localDate(new Date(now.getTime() - WEEK_MS), cfg.checkinUtcOffsetMinutes);
+      const ranked = rankStreaks(await listCheckins(env), today);
+      if (ranked.some((r) => r.lastDate >= weekAgo)) {
+        await sendMessage(env, env.CHANNEL_LEADERBOARD, streaksMessage(cfg, ranked));
+      }
+    });
   }
 }

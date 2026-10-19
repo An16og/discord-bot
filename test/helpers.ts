@@ -14,8 +14,11 @@ export class FakeKV {
   async delete(key: string): Promise<void> {
     this.store.delete(key);
   }
-  async list(opts: { prefix?: string } = {}) {
-    const keys = [...this.store.keys()].filter((k) => k.startsWith(opts.prefix ?? "")).map((name) => ({ name }));
+  async list(opts: { prefix?: string; limit?: number } = {}) {
+    const keys = [...this.store.keys()]
+      .filter((k) => k.startsWith(opts.prefix ?? ""))
+      .slice(0, opts.limit)
+      .map((name) => ({ name }));
     return { keys, list_complete: true, cursor: "" };
   }
 }
@@ -77,6 +80,7 @@ export interface RecordedCall {
   body: any;
   /** The Authorization header, when the call had one. */
   auth?: string;
+  userAgent?: string;
 }
 
 function parseBody(body: unknown): unknown {
@@ -103,10 +107,13 @@ export function mockFetch(
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
     const method = init?.method ?? "GET";
     const body = parseBody(init?.body);
-    const auth = new Headers(init?.headers).get("Authorization") ?? undefined;
-    calls.push({ url: url.href, method, body, auth });
+    const headers = new Headers(init?.headers);
+    const auth = headers.get("Authorization") ?? undefined;
+    const userAgent = headers.get("User-Agent") ?? undefined;
+    calls.push({ url: url.href, method, body, auth, userAgent });
     if (url.hostname === "api.github.com") {
-      return new Response(JSON.stringify(github(url)), { status: 200 });
+      const response = github(url);
+      return response instanceof Response ? response : new Response(JSON.stringify(response), { status: 200 });
     }
     const override = discord({ url: url.href, method, body, auth });
     if (override) return override;
