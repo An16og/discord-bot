@@ -58,6 +58,17 @@ describe("routing", () => {
     const home = await worker.fetch(new Request("https://bot.internal/"), makeEnv({ GIT_SHA: sha }), ctx);
     expect(await home.json()).toMatchObject({ commit: sha });
   });
+
+  it("serves the SVG favicon with the right content type and cache control", async () => {
+    const { ctx } = makeCtx();
+    const res = await worker.fetch(new Request("https://bot.example/favicon.svg"), env, ctx);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("image/svg+xml");
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=86400");
+    const svg = await res.text();
+    expect(svg).toContain("<svg");
+    expect(svg).toContain("</svg>");
+  });
 });
 
 describe("public address", () => {
