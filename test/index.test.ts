@@ -68,7 +68,7 @@ describe("routing", () => {
     expect(res.headers.get("Cache-Control")).toBe("public, max-age=86400");
     const svg = await res.text();
     expect(svg).toContain("<svg");
-    expect(svg).toContain("</svg>");
+    expect(svg).toContain("</svg>");});
   it("names the running version from package.json", async () => {
     const { ctx } = makeCtx();
     const home = await worker.fetch(new Request("https://bot.internal/"), env, ctx);
