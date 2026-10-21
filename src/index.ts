@@ -8,9 +8,9 @@ import { linkedMembers } from "./links";
 import { completeLink } from "./linking";
 import { leaderboardMessage, LINK_BUTTON_ID, streaksMessage } from "./messages";
 import { linkingEnabled } from "./oauth";
-import { cardSvg } from "./card";
-import { contributorPage, leaderboardJson, leaderboardPage, noticePage, standing } from "./page";
-import { currentProgram, findProgram, LEADERBOARD_PATH, leaderboardUrl, programStatus } from "./programs";
+import { BOARD_ROWS, boardSvg, boardVersion, cardSvg } from "./card";
+import { contributorPage, FAVICON_SVG, leaderboardJson, leaderboardPage, noticePage, standing } from "./page";
+import { currentProgram, findProgram, LEADERBOARD_IMAGE_PATH, LEADERBOARD_PATH, leaderboardUrl, programStatus } from "./programs";
 import { verifyDiscordRequest, verifyGithubSignature } from "./verify";
 import { handleGithubEvent, resyncStarterIssues } from "./webhook";
 import { welcomeNewMembers } from "./welcome";
@@ -117,19 +117,21 @@ async function handleLeaderboardPage(request: Request, env: Env, id: string | un
       });
     }
     const self = new URL(`/leaderboard/${program.id}`, request.url).href;
+    // The version makes share previews pick up a new image when the top five change.
+    const image = new URL(`/leaderboard/${program.id}.png?v=${boardVersion(board.rows, program, now)}`, request.url).href;
     const others = cfg.programs
       .filter((p) => p.id !== program.id)
       .reverse()
       .map((p) => ({ title: p.title, path: `/leaderboard/${p.id}` }));
-    const html = leaderboardPage(board, program, { issues: env.ISSUES_URL, discord: env.DISCORD_INVITE, self, others }, now, {
+    const html = leaderboardPage(board, program, { issues: env.ISSUES_URL, discord: env.DISCORD_INVITE, self, image, others }, now, {
       linking: linkingEnabled(env),
     });
     return new Response(html, {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": cache,
-        // Nothing on the page runs scripts or loads anything but GitHub avatars.
-        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src https://github.com https://avatars.githubusercontent.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        // Nothing on the page runs scripts or loads anything but the favicon and GitHub avatars.
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https://github.com https://avatars.githubusercontent.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "strict-origin-when-cross-origin",
       },
@@ -144,6 +146,53 @@ async function handleLeaderboardPage(request: Request, env: Env, id: string | un
   }
 }
 
+// A program's leaderboard as a share image: /leaderboard/{id}.png. The page's
+// og:image points here.
+async function handleLeaderboardImage(request: Request, env: Env, ctx: ExecutionContext, id: string): Promise<Response> {
+  const cfg = getConfig(env);
+  const now = new Date();
+  const program = findProgram(cfg, id);
+  if (!program) return new Response("not found", { status: 404 });
+
+  // The image is the same for everyone and costs some CPU to draw, so keep it at the edge.
+  const cache = typeof caches !== "undefined" ? await caches.open("cards").catch(() => undefined) : undefined;
+  // The cache only takes GET requests, and it keys on the address. So a HEAD
+  // asks for the image under the key a GET uses, and stores it there too:
+  // otherwise the cache would throw, and the image would be left empty for the
+  // next GET.
+  const cacheKey = request.method === "GET" ? request : new Request(request.url);
+  const cached = await cache?.match(cacheKey);
+  if (cached) return cached;
+
+  let board;
+  try {
+    board = await getLeaderboard(env, cfg, program);
+  } catch (err) {
+    console.error("leaderboard image failed", err);
+    return new Response("The leaderboard is unavailable right now.", {
+      status: 503,
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Retry-After": "60" },
+    });
+  }
+
+  // Loaded on demand: this module pulls in the rasterizer and the fonts.
+  const { fetchAvatar, renderPng } = await import("./card-image");
+  const avatars = await Promise.all(board.rows.slice(0, BOARD_ROWS).map((row) => fetchAvatar(row.login)));
+  const svg = boardSvg({
+    program,
+    rows: board.rows,
+    avatars,
+    now,
+    site: cfg.publicUrl ? new URL(cfg.publicUrl).host : new URL(request.url).host,
+  });
+  const png = await renderPng(svg);
+  const response = new Response(png, {
+    headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=600", "X-Content-Type-Options": "nosniff" },
+  });
+  if (cache) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+
 // Where Discord sends a member after they approve (or cancel) the /link request.
 async function handleLinkCallback(request: Request, env: Env): Promise<Response> {
   const outcome = await completeLink(env, getConfig(env), new URL(request.url).searchParams, new Date());
@@ -154,7 +203,7 @@ async function handleLinkCallback(request: Request, env: Env): Promise<Response>
       // The URL carries a one-time code. Keep it out of caches and referrers.
       "Cache-Control": "no-store",
       "Referrer-Policy": "no-referrer",
-      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       "X-Content-Type-Options": "nosniff",
     },
   });
@@ -187,7 +236,12 @@ async function handleContributor(
 
   // The card is the same for everyone and costs some CPU to draw, so keep it at the edge.
   const cache = asPng && typeof caches !== "undefined" ? await caches.open("cards").catch(() => undefined) : undefined;
-  const cached = await cache?.match(request);
+  // The cache only takes GET requests, and it keys on the address. So a HEAD
+  // asks for the card under the key a GET uses, and stores it there too:
+  // otherwise the cache would throw, and the card would be left empty for the
+  // next GET.
+  const cacheKey = request.method === "GET" ? request : new Request(request.url);
+  const cached = await cache?.match(cacheKey);
   if (cached) return cached;
 
   let board;
@@ -238,7 +292,7 @@ async function handleContributor(
     const response = new Response(png, {
       headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=600", "X-Content-Type-Options": "nosniff" },
     });
-    if (cache) ctx.waitUntil(cache.put(request, response.clone()));
+    if (cache) ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return response;
   }
 
@@ -262,30 +316,13 @@ async function handleContributor(
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const { pathname } = url;
-    if (request.method === "POST" && pathname === "/interactions") return handleInteraction(request, env, ctx);
-    if (request.method === "POST" && pathname === "/github") return handleGithubWebhook(request, env);
-
-    // The public pages have their own address. Links to them on the Worker's
-    // workers.dev address keep working by redirecting there.
-    const publicUrl = getConfig(env).publicUrl;
-    const onPublicHost = publicUrl !== "" && new URL(publicUrl).host === url.host;
-    if (request.method === "GET" && pathname.startsWith("/leaderboard") && !onPublicHost && url.hostname.endsWith(".workers.dev") && publicUrl) {
-      return Response.redirect(`${publicUrl}${pathname}${url.search}`, 301);
-    }
-    if (request.method === "GET" && pathname === "/" && onPublicHost) {
-      return Response.redirect(`${publicUrl}/leaderboard`, 302);
-    }
-    const page = request.method === "GET" ? LEADERBOARD_PATH.exec(pathname) : null;
-    if (page) return handleLeaderboardPage(request, env, page[1], page[2] !== undefined);
-    const person = request.method === "GET" ? CONTRIBUTOR_PATH.exec(pathname) : null;
-    if (person) return handleContributor(request, env, ctx, person[1]!, person[2]!, person[3] !== undefined);
-    if (request.method === "GET" && pathname === "/link/callback") return handleLinkCallback(request, env);
-    if (request.method === "GET" && pathname === "/") {
-      return json({ name: "codercops-discord-bot", source: "https://github.com/codercops/discord-bot", version, commit: env.GIT_SHA || "dev" });
-    }
-    return new Response("not found", { status: 404 });
+    const response = await route(request, env, ctx);
+    if (request.method !== "HEAD" || !response.body) return response;
+    // A HEAD is a GET without the body: the same status and the same headers,
+    // and nothing to read.
+    const { status, statusText, headers } = response;
+    await response.arrayBuffer();
+    return new Response(null, { status, statusText, headers });
   },
 
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
@@ -298,6 +335,51 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+// The public pages answer GET and HEAD alike. /link/callback stays on GET
+// alone, because it spends a one-time code from Discord.
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const url = new URL(request.url);
+  const { pathname } = url;
+  if (request.method === "POST" && pathname === "/interactions") return handleInteraction(request, env, ctx);
+  if (request.method === "POST" && pathname === "/github") return handleGithubWebhook(request, env);
+
+  const read = request.method === "GET" || request.method === "HEAD";
+
+  // The public pages have their own address. Links to them on the Worker's
+  // workers.dev address keep working by redirecting there.
+  const publicUrl = getConfig(env).publicUrl;
+  const onPublicHost = publicUrl !== "" && new URL(publicUrl).host === url.host;
+  if (read && pathname.startsWith("/leaderboard") && !onPublicHost && url.hostname.endsWith(".workers.dev") && publicUrl) {
+    return Response.redirect(`${publicUrl}${pathname}${url.search}`, 301);
+  }
+  if (read && pathname === "/" && onPublicHost) {
+    return Response.redirect(`${publicUrl}/leaderboard`, 302);
+  }
+  if (read && pathname !== "/" && pathname.endsWith("/")) {
+    return Response.redirect(`${url.origin}${pathname.replace(/\/+$/, "") || "/"}${url.search}`, 301);
+  }
+  const page = read ? LEADERBOARD_PATH.exec(pathname) : null;
+  if (page) return handleLeaderboardPage(request, env, page[1], page[2] !== undefined);
+  const boardImage = read ? LEADERBOARD_IMAGE_PATH.exec(pathname) : null;
+  if (boardImage) return handleLeaderboardImage(request, env, ctx, boardImage[1]!);
+  const person = read ? CONTRIBUTOR_PATH.exec(pathname) : null;
+  if (person) return handleContributor(request, env, ctx, person[1]!, person[2]!, person[3] !== undefined);
+  if (request.method === "GET" && pathname === "/link/callback") return handleLinkCallback(request, env);
+  if (read && pathname === "/favicon.svg") {
+    return new Response(FAVICON_SVG, {
+      headers: {
+        "Content-Type": "image/svg+xml",
+        "Cache-Control": "public, max-age=86400",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
+  if (read && pathname === "/") {
+    return json({ name: "codercops-discord-bot", source: "https://github.com/codercops/discord-bot", version, commit: env.GIT_SHA || "dev" });
+  }
+  return new Response("not found", { status: 404 });
+}
 
 // Mondays: the leaderboard of every running program, plus the learning streaks.
 // Any day: the final results of a program that has just ended, once.

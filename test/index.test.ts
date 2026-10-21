@@ -60,10 +60,45 @@ describe("routing", () => {
     expect(await home.json()).toMatchObject({ commit: sha });
   });
 
+  it("serves the SVG favicon with the right content type and cache control", async () => {
+    const { ctx } = makeCtx();
+    const res = await worker.fetch(new Request("https://bot.example/favicon.svg"), env, ctx);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("image/svg+xml");
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=86400");
+    const svg = await res.text();
+    expect(svg).toContain("<svg");
+    expect(svg).toContain("</svg>");});
   it("names the running version from package.json", async () => {
     const { ctx } = makeCtx();
     const home = await worker.fetch(new Request("https://bot.internal/"), env, ctx);
     expect(await home.json()).toMatchObject({ version });
+  });
+
+  it("answers a HEAD like the GET, with the same headers and no body", async () => {
+    const { ctx } = makeCtx();
+    const get = await worker.fetch(new Request("https://bot.internal/"), env, ctx);
+    const head = await worker.fetch(new Request("https://bot.internal/", { method: "HEAD" }), env, ctx);
+    expect(head.status).toBe(get.status);
+    expect(head.headers.get("Content-Type")).toBe(get.headers.get("Content-Type"));
+    expect(await head.text()).toBe("");
+  });
+
+  it("still 404s a HEAD for a path that isn't there", async () => {
+    const { ctx } = makeCtx();
+    const res = await worker.fetch(new Request("https://bot.example/nope", { method: "HEAD" }), env, ctx);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe("");
+  });
+
+  it("leaves the link callback on GET, so a HEAD never spends the code", async () => {
+    // Linking is on, so a GET here would talk to Discord.
+    const fetched = mockFetch();
+    const { ctx } = makeCtx();
+    const linking = makeEnv({ LINKING: "on", DISCORD_CLIENT_SECRET: "secret" });
+    const res = await worker.fetch(new Request("https://bot.example/link/callback?code=abc&state=xyz", { method: "HEAD" }), linking, ctx);
+    expect(res.status).toBe(404);
+    expect(fetched.calls).toHaveLength(0);
   });
 });
 
@@ -91,6 +126,26 @@ describe("public address", () => {
     // A local preview isn't redirected.
     const local = await worker.fetch(new Request("http://localhost:8787/leaderboard"), env, ctx);
     expect(local.status).toBe(200);
+  });
+
+  it("redirects trailing slashes to the path without them, keeping query strings", async () => {
+    const { ctx } = makeCtx();
+    for (const path of ["/leaderboard/", "/leaderboard/2026-10/", "/leaderboard/2026-10/u/ada/"]) {
+      const res = await worker.fetch(new Request(`https://bot.example${path}`), env, ctx);
+      expect(res.status).toBe(301);
+      expect(res.headers.get("Location")).toBe(`https://bot.example${path.replace(/\/+$/, "")}`);
+    }
+
+    const withQuery = await worker.fetch(new Request("https://bot.example/leaderboard/2026-10/?x=1"), env, ctx);
+    expect(withQuery.status).toBe(301);
+    expect(withQuery.headers.get("Location")).toBe("https://bot.example/leaderboard/2026-10?x=1");
+
+    const head = await worker.fetch(new Request("https://bot.example/leaderboard/", { method: "HEAD" }), env, ctx);
+    expect(head.status).toBe(301);
+    expect(head.headers.get("Location")).toBe("https://bot.example/leaderboard");
+
+    const post = await worker.fetch(new Request("https://bot.example/leaderboard/", { method: "POST" }), env, ctx);
+    expect(post.status).toBe(404);
   });
 });
 
@@ -248,7 +303,7 @@ describe("scheduled leaderboard", () => {
     env = makeEnv({ FINAL_RESULTS_NOTE: "Add it to your profile." });
     const fetched = mockFetch(() => ({
       total_count: 1,
-      items: [{ html_url: "https://github.com/codercops/toolbelt/pull/1", user: { login: "ada" }, pull_request: { merged_at: "2026-10-02T00:00:00Z" } }],
+      items: [{ html_url: "https://github.com/codercops/toolbelt/pull/1", number: 1, title: "Fix a thing", repository_url: "https://api.github.com/repos/codercops/toolbelt", user: { login: "ada" }, pull_request: { merged_at: "2026-10-02T00:00:00Z" } }],
     }));
     await run("2026-11-01T04:30:00Z");
     expect(fetched.discord()[0]?.body.embeds[0].description).toContain("Add it to your profile.");
